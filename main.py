@@ -31,12 +31,23 @@ def current_slot_idx() -> int:
 
 async def copy_message(message_id: int):
     await ensure_connected()
-    return await client(functions.messages.CopyMessagesRequest(
-        from_peer=SOURCE_CHAT,
-        id=[message_id],
-        to_peer=TARGET_CHAT,
-        random_id=[utils.generate_random_long()]
-    ))
+    # Use the correct Telethon raw function name
+    try:
+        req = functions.messages.CopyMessages(
+            from_peer=SOURCE_CHAT,
+            id=[message_id],
+            to_peer=TARGET_CHAT,
+            random_id=[utils.generate_random_long()]
+        )
+        return await client(req)
+    except AttributeError:
+        # Very old Telethon version fallback: do a regular forward
+        # (this will show "Forwarded from")
+        return await client.forward_messages(
+            entity=TARGET_CHAT,
+            messages=[message_id],
+            from_peer=SOURCE_CHAT
+        )
 
 @app.get("/health")
 async def health():
@@ -69,3 +80,4 @@ async def hook(request: Request):
         return {"ok": True, "copied_message_id": message_id, "result": str(res)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"copyMessage failed: {e}")
+

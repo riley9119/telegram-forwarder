@@ -1,10 +1,13 @@
 import os
+from typing import Optional, Union
+
 from fastapi import FastAPI, Request, HTTPException
 from telethon import TelegramClient, functions, utils
 from telethon.sessions import StringSession
 from datetime import datetime
 import pytz
 
+# --- ENV ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("TELETHON_STRING_SESSION", "")
@@ -14,9 +17,20 @@ TIMEZONE = os.getenv("TIMEZONE", "Asia/Jakarta")
 ROTATION_IDS = [s.strip() for s in os.getenv("ROTATION_12_IDS", "").split(",") if s.strip()]
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional
 
+# Topic support (optional)
+def _as_int(v) -> Optional[int]:
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+TARGET_TOPIC_ID = os.getenv("TARGET_TOPIC_ID")  # e.g., "380252"
+TOPIC_TOP_MSG_ID: Optional[int] = _as_int(TARGET_TOPIC_ID)
+
 if not all([API_ID, API_HASH, STRING_SESSION, SOURCE_CHAT, TARGET_CHAT]):
     raise RuntimeError("Missing required env vars")
 
+# --- APP / CLIENT ---
 app = FastAPI()
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
@@ -29,32 +43,53 @@ def current_slot_idx() -> int:
     now_local = datetime.now(tz)
     return (now_local.hour // 2) % 12  # 12 posts/day => every 2 hours
 
-async def copy_message(message_id: int):
+async def copy_message(
+    message_id: int,
+    to_peer: Optional[Union[str, int]] = None,
+    topic_id: Optional[int] = None
+):
+    """
+    Copy a single message by ID from SOURCE_CHAT to TARGET_CHAT.
+    If a topic_id (top_msg_id) is provided (or configured via env),
+    the message will be posted into that forum topic.
+    """
     await ensure_connected()
-    # Use the correct Telethon raw function name
+
+    dest = to_peer or TARGET_CHAT
+
+    # Prefer explicit topic override; otherwise use env default
+    kwargs = {}
+    if topic_id is not None:
+        kwargs["top_msg_id"] = int(topic_id)
+    elif TOPIC_TOP_MSG_ID is not None:
+        kwargs["top_msg_id"] = TOPIC_TOP_MSG_ID
+
     try:
         req = functions.messages.CopyMessages(
             from_peer=SOURCE_CHAT,
-            id=[message_id],
-            to_peer=TARGET_CHAT,
-            random_id=[utils.generate_random_long()]
+            id=[int(message_id)],
+            to_peer=dest,
+            random_id=[utils.generate_random_long()],
+            **kwargs,
         )
         return await client(req)
     except AttributeError:
-        # Very old Telethon version fallback: do a regular forward
-        # (this will show "Forwarded from")
+        # Very old Telethon fallback: forward (will show "Forwarded from")
+        # Note: forward_messages has no top_msg_id, so topic posting
+        # via fallback is not supported.
         return await client.forward_messages(
-            entity=TARGET_CHAT,
-            messages=[message_id],
+            entity=dest,
+            messages=[int(message_id)],
             from_peer=SOURCE_CHAT
         )
 
 @app.get("/health")
 async def health():
-    return {"status":"ok"}
+    return {"status": "ok"}
 
 @app.post("/hook")
 async def hook(request: Request):
+    # Optional shared secret
     if WEBHOOK_SECRET and request.headers.get("x-webhook-secret") != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
@@ -64,8 +99,8 @@ async def hook(request: Request):
         payload = {}
 
     # Modes:
-    # 1) {"message_id": 12345}  (direct)
-    # 2) {"slot":"auto"}        (use ROTATION_12_IDS and local time slot)
+    # 1) {"message_id": 12345}
+    # 2) {"slot":"auto"}  -> uses ROTATION_12_IDS and local time slot
     if isinstance(payload, dict) and "message_id" in payload:
         message_id = int(payload["message_id"])
     elif isinstance(payload, dict) and payload.get("slot") == "auto":
@@ -75,9 +110,20 @@ async def hook(request: Request):
     else:
         raise HTTPException(status_code=400, detail='Provide {"message_id":N} or {"slot":"auto"}')
 
+    # Optional: override topic per request
+    topic_override = None
+    if isinstance(payload, dict) and "topic_id" in payload:
+        topic_override = _as_int(payload["topic_id"])
+        if payload["topic_id"] is not None and topic_override is None:
+            raise HTTPException(status_code=400, detail="topic_id must be an integer")
+
     try:
-        res = await copy_message(message_id)
-        return {"ok": True, "copied_message_id": message_id, "result": str(res)}
+        res = await copy_message(message_id, topic_id=topic_override)
+        return {
+            "ok": True,
+            "copied_message_id": message_id,
+            "topic_id": topic_override if topic_override is not None else TOPIC_TOP_MSG_ID,
+            "result": str(res),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"copyMessage failed: {e}")
-

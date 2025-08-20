@@ -2,7 +2,7 @@ import os
 from typing import Optional, Union
 
 from fastapi import FastAPI, Request, HTTPException
-from telethon import TelegramClient, functions, utils
+from telethon import TelegramClient, functions, utils, types
 from telethon.sessions import StringSession
 from datetime import datetime
 import pytz
@@ -11,11 +11,13 @@ import pytz
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("TELETHON_STRING_SESSION", "")
-SOURCE_CHAT = os.getenv("SOURCE_CHAT", "")   # @username, -100id, or private invite link
+
+SOURCE_CHAT = os.getenv("SOURCE_CHAT", "")   # @username or -100id or t.me/...
 TARGET_CHAT = os.getenv("TARGET_CHAT", "")   # @username or -100id
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Jakarta")
+
 ROTATION_IDS = [s.strip() for s in os.getenv("ROTATION_12_IDS", "").split(",") if s.strip()]
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional shared secret
 
 def _as_int(v) -> Optional[int]:
     try:
@@ -23,8 +25,8 @@ def _as_int(v) -> Optional[int]:
     except (TypeError, ValueError):
         return None
 
-TARGET_TOPIC_ID = os.getenv("TARGET_TOPIC_ID")       # e.g. "380252"
-TOPIC_TOP_MSG_ID: Optional[int] = _as_int(TARGET_TOPIC_ID)
+# Forum topic support (numeric message ID of the topic starter message)
+TARGET_TOPIC_ID = _as_int(os.getenv("TARGET_TOPIC_ID"))
 
 if not all([API_ID, API_HASH, STRING_SESSION, SOURCE_CHAT, TARGET_CHAT]):
     raise RuntimeError("Missing required env vars")
@@ -33,69 +35,99 @@ if not all([API_ID, API_HASH, STRING_SESSION, SOURCE_CHAT, TARGET_CHAT]):
 app = FastAPI()
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
+
 async def ensure_connected():
     if not client.is_connected():
         await client.connect()
 
+
 def current_slot_idx() -> int:
     tz = pytz.timezone(TIMEZONE)
     now_local = datetime.now(tz)
-    return (now_local.hour // 2) % 12  # 12 posts/day => every 2 hours
+    # 12 posts/day => every 2 hours
+    return (now_local.hour // 2) % 12
 
-async def send_to_topic_via_forward(
-    message_id: int,
-    to_peer: Union[str, int],
-    topic_id: int
+
+async def _re_send_to_topic(
+    src_msg_id: int,
+    dest_peer: Union[str, int],
+    topic_top_msg_id: int
 ):
-    """Post to a forum topic using ForwardMessages (supports top_msg_id)."""
-    req = functions.messages.ForwardMessages(
-        from_peer=SOURCE_CHAT,
-        id=[int(message_id)],
-        to_peer=to_peer,
-        random_id=[utils.generate_random_long()],
-        top_msg_id=int(topic_id),
-    )
-    return await client(req)
+    """
+    Re-send a source message (text/media/buttons) into a specific forum topic, by
+    replying to the topic's top message (top_msg_id).
+    This avoids the 'Forwarded from' label and works for forum topics.
+    """
+    await ensure_connected()
 
-async def copy_or_forward(
+    # fetch source message
+    msg = await client.get_messages(SOURCE_CHAT, ids=src_msg_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Source message not found")
+
+    reply_to = types.InputReplyToMessage(top_msg_id=int(topic_top_msg_id))
+
+    # Re-send media or text
+    if msg.media:
+        # send_file accepts message.media directly; caption is msg.message (may be None)
+        return await client.send_file(
+            dest_peer,
+            file=msg.media,
+            caption=msg.message or "",
+            reply_to=reply_to,
+            buttons=msg.buttons
+        )
+    else:
+        # plain text (keep buttons if present)
+        return await client.send_message(
+            dest_peer,
+            msg.message or "",
+            reply_to=reply_to,
+            buttons=msg.buttons
+        )
+
+
+async def copy_message(
     message_id: int,
     to_peer: Optional[Union[str, int]] = None,
     topic_id: Optional[int] = None
 ):
     """
-    - If a topic is requested: use ForwardMessages with top_msg_id (reliable for topics).
-    - If no topic: try CopyMessages (clean copy). If that fails, fallback to forward.
+    Copy a single message by ID from SOURCE_CHAT to TARGET_CHAT.
+    - If a topic_id (or TARGET_TOPIC_ID) is provided, re-send the message into that topic.
+    - Otherwise, use MTProto copy (no 'Forwarded from' label).
     """
     await ensure_connected()
     dest = to_peer or TARGET_CHAT
 
-    # If we have a topic to use (payload override > env), forward into topic
-    effective_topic = topic_id if topic_id is not None else TOPIC_TOP_MSG_ID
+    # If we have a topic to target, re-send (copy) into that topic.
+    effective_topic = topic_id if topic_id is not None else TARGET_TOPIC_ID
     if effective_topic is not None:
-        return await send_to_topic_via_forward(message_id, dest, effective_topic)
+        return await _re_send_to_topic(message_id, dest, effective_topic)
 
-    # No topic -> prefer CopyMessages (no "Forwarded from")
+    # No topic -> use raw copy (keeps caption/media without 'Forwarded from')
     try:
         req = functions.messages.CopyMessages(
             from_peer=SOURCE_CHAT,
             id=[int(message_id)],
             to_peer=dest,
             random_id=[utils.generate_random_long()],
+            # No top_msg_id here (CopyMessages does not support it)
         )
         return await client(req)
     except Exception:
-        # Fallback to a regular forward if copy is unavailable
-        req2 = functions.messages.ForwardMessages(
-            from_peer=SOURCE_CHAT,
-            id=[int(message_id)],
-            to_peer=dest,
-            random_id=[utils.generate_random_long()],
+        # Fallback: forward (will show "Forwarded from")
+        return await client.forward_messages(
+            entity=dest,
+            messages=[int(message_id)],
+            from_peer=SOURCE_CHAT
         )
-        return await client(req2)
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 @app.post("/hook")
 async def hook(request: Request):
@@ -128,12 +160,22 @@ async def hook(request: Request):
             raise HTTPException(status_code=400, detail="topic_id must be an integer")
 
     try:
-        res = await copy_or_forward(message_id, topic_id=topic_override)
+        res = await copy_message(message_id, topic_id=topic_override)
+        # Try to return some useful identifiers
+        copied_id = None
+        try:
+            # Telethon Message object (send_message/send_file path)
+            copied_id = getattr(res, "id", None)
+        except Exception:
+            pass
+
         return {
             "ok": True,
             "copied_message_id": message_id,
-            "topic_id": topic_override if topic_override is not None else TOPIC_TOP_MSG_ID,
-            "result": str(res),
+            "new_message_id": copied_id,
+            "topic_id": topic_override if topic_override is not None else TARGET_TOPIC_ID,
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"send failed: {e}")
+        raise HTTPException(status_code=500, detail=f"copyMessage failed: {e}")

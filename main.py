@@ -7,30 +7,33 @@ from telethon.sessions import StringSession
 from datetime import datetime
 import pytz
 
-# --- ENV ---
+# ---------- ENV ----------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("TELETHON_STRING_SESSION", "")
-SOURCE_CHAT = os.getenv("SOURCE_CHAT", "")   # @username or -100id
-TARGET_CHAT = os.getenv("TARGET_CHAT", "")   # @username or -100id
+
+# Accept @username or numeric -100xxxxxxxxxxxx. (Avoid t.me links.)
+SOURCE_CHAT = os.getenv("SOURCE_CHAT", "")
+TARGET_CHAT = os.getenv("TARGET_CHAT", "")
+
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Jakarta")
 ROTATION_IDS = [s.strip() for s in os.getenv("ROTATION_12_IDS", "").split(",") if s.strip()]
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional shared secret
 
-# Topic support (optional)
 def _as_int(v) -> Optional[int]:
     try:
         return int(str(v).strip())
     except (TypeError, ValueError):
         return None
 
-TARGET_TOPIC_ID = os.getenv("TARGET_TOPIC_ID")  # e.g., "380252"
-TOPIC_TOP_MSG_ID: Optional[int] = _as_int(TARGET_TOPIC_ID)
+# Optional default topic (top message id) for TARGET_CHAT forum
+TARGET_TOPIC_ID_ENV = os.getenv("TARGET_TOPIC_ID")
+TOPIC_TOP_MSG_ID: Optional[int] = _as_int(TARGET_TOPIC_ID_ENV)
 
 if not all([API_ID, API_HASH, STRING_SESSION, SOURCE_CHAT, TARGET_CHAT]):
-    raise RuntimeError("Missing required env vars")
+    raise RuntimeError("Missing required env vars: API_ID/API_HASH/TELETHON_STRING_SESSION/SOURCE_CHAT/TARGET_CHAT")
 
-# --- APP / CLIENT ---
+# ---------- APP / CLIENT ----------
 app = FastAPI()
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
@@ -41,7 +44,13 @@ async def ensure_connected():
 def current_slot_idx() -> int:
     tz = pytz.timezone(TIMEZONE)
     now_local = datetime.now(tz)
-    return (now_local.hour // 2) % 12  # 12 posts/day => every 2 hours
+    # 12 posts/day => every 2 hours
+    return (now_local.hour // 2) % 12
+
+async def resolve_peer(peer: Union[str, int]):
+    """Return an InputPeer usable by raw TL functions."""
+    await ensure_connected()
+    return await client.get_input_entity(peer)
 
 async def copy_message(
     message_id: int,
@@ -49,40 +58,41 @@ async def copy_message(
     topic_id: Optional[int] = None
 ):
     """
-    Copy a single message by ID from SOURCE_CHAT to TARGET_CHAT.
-    If a topic_id (top_msg_id) is provided (or configured via env),
-    the message will be posted into that forum topic.
+    Send one message from SOURCE_CHAT to TARGET_CHAT.
+
+    If a topic_id (top_msg_id) is provided (or set via env),
+    we use ForwardMessages with top_msg_id (most reliable for forum topics).
+    If no topic is provided, we use CopyMessages (a true copy).
     """
     await ensure_connected()
 
     dest = to_peer or TARGET_CHAT
+    from_peer = await resolve_peer(SOURCE_CHAT)
+    to_peer_in = await resolve_peer(dest)
 
-    # Prefer explicit topic override; otherwise use env default
-    kwargs = {}
-    if topic_id is not None:
-        kwargs["top_msg_id"] = int(topic_id)
-    elif TOPIC_TOP_MSG_ID is not None:
-        kwargs["top_msg_id"] = TOPIC_TOP_MSG_ID
+    top_id = _as_int(topic_id) if topic_id is not None else TOPIC_TOP_MSG_ID
 
-    try:
-        req = functions.messages.CopyMessages(
-            from_peer=SOURCE_CHAT,
+    # Use ForwardMessages when targeting a Topic
+    if top_id is not None:
+        req = functions.messages.ForwardMessages(
+            from_peer=from_peer,
             id=[int(message_id)],
-            to_peer=dest,
+            to_peer=to_peer_in,
             random_id=[utils.generate_random_long()],
-            **kwargs,
+            top_msg_id=int(top_id)
         )
         return await client(req)
-    except AttributeError:
-        # Very old Telethon fallback: forward (will show "Forwarded from")
-        # Note: forward_messages has no top_msg_id, so topic posting
-        # via fallback is not supported.
-        return await client.forward_messages(
-            entity=dest,
-            messages=[int(message_id)],
-            from_peer=SOURCE_CHAT
-        )
 
+    # No topic => do a true copy
+    req = functions.messages.CopyMessages(
+        from_peer=from_peer,
+        id=[int(message_id)],
+        to_peer=to_peer_in,
+        random_id=[utils.generate_random_long()]
+    )
+    return await client(req)
+
+# ---------- ROUTES ----------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -100,7 +110,7 @@ async def hook(request: Request):
 
     # Modes:
     # 1) {"message_id": 12345}
-    # 2) {"slot":"auto"}  -> uses ROTATION_12_IDS and local time slot
+    # 2) {"slot":"auto"} -> uses ROTATION_12_IDS and local time (2-hour slots)
     if isinstance(payload, dict) and "message_id" in payload:
         message_id = int(payload["message_id"])
     elif isinstance(payload, dict) and payload.get("slot") == "auto":
@@ -110,8 +120,8 @@ async def hook(request: Request):
     else:
         raise HTTPException(status_code=400, detail='Provide {"message_id":N} or {"slot":"auto"}')
 
-    # Optional: override topic per request
-    topic_override = None
+    # Optional: per-request topic override
+    topic_override: Optional[int] = None
     if isinstance(payload, dict) and "topic_id" in payload:
         topic_override = _as_int(payload["topic_id"])
         if payload["topic_id"] is not None and topic_override is None:

@@ -3,10 +3,18 @@ import logging
 from typing import Optional, Union, List, Tuple
 
 from fastapi import FastAPI, Request, HTTPException
-from telethon import TelegramClient, utils, __version__ as telethon_version
+from telethon import TelegramClient, __version__ as telethon_version
 from telethon.sessions import StringSession
 from datetime import datetime
 import pytz
+
+# ---- random_id helper (Telethon raw calls need 64-bit randoms) ----
+try:
+    from telethon.helpers import generate_random_long
+except Exception:
+    import random
+    def generate_random_long() -> int:
+        return random.randrange(1 << 63)
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -40,9 +48,12 @@ API_HASH = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("TELETHON_STRING_SESSION", "")
 SOURCE_CHAT = os.getenv("SOURCE_CHAT", "")   # @username or -100id
 
-TARGET_CHAT = os.getenv("TARGET_CHAT", "")   # legacy single-target default
-TARGET_TOPIC_ID_ENV = os.getenv("TARGET_TOPIC_ID", "")  # legacy default topic
-TARGETS_ENV = os.getenv("TARGETS", "")       # NEW: multi-target list: chat[:topic_id],chat[:topic_id]
+# Legacy single-target envs (still supported)
+TARGET_CHAT = os.getenv("TARGET_CHAT", "")
+TARGET_TOPIC_ID_ENV = os.getenv("TARGET_TOPIC_ID", "")
+
+# NEW: multi-targets "chat[:topic_id],chat[:topic_id]"
+TARGETS_ENV = os.getenv("TARGETS", "")
 
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Jakarta")
 ROTATION_IDS = [s.strip() for s in os.getenv("ROTATION_12_IDS", "").split(",") if s.strip()]
@@ -115,17 +126,22 @@ async def copy_message(
     dest = to_peer
     top_id = _as_int(topic_id)
 
+    # Prepare a random_id list (one per message)
+    rand_ids = [generate_random_long()]
+
     # Try CopyMessages first
     if CopyMessages is not None:
         try:
             log.info("Using raw CopyMessages to %s with top_msg_id=%s", dest, top_id)
-            req = CopyMessages(
+            kwargs = dict(
                 from_peer=SOURCE_CHAT,
                 id=[int(message_id)],
                 to_peer=dest,
-                random_id=[utils.generate_random_long()],
-                **({"top_msg_id": top_id} if top_id else {})
+                random_id=rand_ids,
             )
+            if top_id:
+                kwargs["top_msg_id"] = top_id
+            req = CopyMessages(**kwargs)
             return await client(req)
         except Exception as e:
             log.warning("CopyMessages failed (%s); trying ForwardMessages…", e)
@@ -134,13 +150,15 @@ async def copy_message(
     if ForwardMessages is not None:
         try:
             log.info("Using raw ForwardMessages to %s with top_msg_id=%s", dest, top_id)
-            req = ForwardMessages(
+            kwargs = dict(
                 from_peer=SOURCE_CHAT,
                 id=[int(message_id)],
                 to_peer=dest,
-                random_id=[utils.generate_random_long()],
-                **({"top_msg_id": top_id} if top_id else {})
+                random_id=rand_ids,
             )
+            if top_id:
+                kwargs["top_msg_id"] = top_id
+            req = ForwardMessages(**kwargs)
             return await client(req)
         except Exception as e:
             log.warning("ForwardMessages failed (%s); falling back to plain forward (no topic).", e)
@@ -180,7 +198,7 @@ async def hook(request: Request):
     # Build targets
     targets = list(MULTI_TARGETS)
 
-    # Optional override (rare): payload.targets = [{"chat":"@name","topic_id":123}, ...]
+    # Optional override: payload.targets = [{"chat":"@name","topic_id":123}, ...]
     if isinstance(payload, dict) and isinstance(payload.get("targets"), list):
         tmp: List[Tuple[str, Optional[int]]] = []
         for t in payload["targets"]:
@@ -191,8 +209,7 @@ async def hook(request: Request):
         if tmp:
             targets = tmp
 
-    # Legacy: if someone passes "topic_id" in payload and only a single target exists,
-    # apply it to that single target (kept for backwards compatibility)
+    # Legacy: apply single payload topic to single configured target
     if isinstance(payload, dict) and "topic_id" in payload and len(targets) == 1:
         targets = [(targets[0][0], _as_int(payload["topic_id"]))]
 

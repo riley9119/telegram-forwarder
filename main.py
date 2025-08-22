@@ -1,9 +1,10 @@
 import os
 import logging
+import secrets
 from typing import Optional, Union
 
 from fastapi import FastAPI, Request, HTTPException
-from telethon import TelegramClient, utils, __version__ as telethon_version
+from telethon import TelegramClient, __version__ as telethon_version
 from telethon.sessions import StringSession
 from datetime import datetime
 import pytz
@@ -38,12 +39,12 @@ except Exception:
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("TELETHON_STRING_SESSION", "")
-SOURCE_CHAT = os.getenv("SOURCE_CHAT", "")   # @username or -100id
+SOURCE_CHAT = os.getenv("SOURCE_CHAT", "")   # @username or -100id or join link (if your session is already in)
 TARGET_CHAT = os.getenv("TARGET_CHAT", "")   # @username or -100id
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Jakarta")
 ROTATION_IDS = [s.strip() for s in os.getenv("ROTATION_12_IDS", "").split(",") if s.strip()]
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-TARGET_TOPIC_ID_ENV = os.getenv("TARGET_TOPIC_ID", "")
+TARGET_TOPIC_ID_ENV = os.getenv("TARGET_TOPIC_ID", "")  # e.g. "380252"
 
 def _as_int(v) -> Optional[int]:
     try:
@@ -59,6 +60,10 @@ if not all([API_ID, API_HASH, STRING_SESSION, SOURCE_CHAT, TARGET_CHAT]):
 # ---------- app/client ----------
 app = FastAPI()
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+
+def _rand_long() -> int:
+    # 63 bits so it fits a signed int64 and stays positive
+    return secrets.randbits(63)
 
 @app.on_event("startup")
 async def _startup():
@@ -100,7 +105,7 @@ async def copy_message(
                 from_peer=SOURCE_CHAT,
                 id=[int(message_id)],
                 to_peer=dest,
-                random_id=[utils.generate_random_long()],
+                random_id=[_rand_long()],
                 **({"top_msg_id": top_id} if top_id else {})
             )
             return await client(req)
@@ -115,7 +120,7 @@ async def copy_message(
                 from_peer=SOURCE_CHAT,
                 id=[int(message_id)],
                 to_peer=dest,
-                random_id=[utils.generate_random_long()],
+                random_id=[_rand_long()],
                 **({"top_msg_id": top_id} if top_id else {})
             )
             return await client(req)

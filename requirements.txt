@@ -1,5 +1,6 @@
 fastapi==0.111.0
 uvicorn==0.30.1
-telethon>=1.34.0
+telethon>=1.35.0
 pytz
 python-dotenv
+
